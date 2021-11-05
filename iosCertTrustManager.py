@@ -1,8 +1,8 @@
 #! /usr/bin/env python
 
-# Script to manage additional trusted root certificate in the IOS simulator
+# Script to manage additional trusted root certificate in the simulator
 #
-# Allows to add/list/delete/export trusted root certificates to the IOS simulator
+# Allows to add/list/delete/export trusted root certificates to the simulator
 # TrustStore.sqlite3 file.
 #
 # Additionally, root certificates added to a device can be listed and exported from 
@@ -54,6 +54,7 @@ def query_yes_no(question, default="yes"):
         raise ValueError("invalid default answer: '%s'" % default)
 
     while 1:
+        sys.stdout.write(question + prompt)
         choice = raw_input().lower()
         if default is not None and choice == '':
             return default
@@ -331,7 +332,6 @@ class Certificate:
         self._init_data()
 
     def _init_data(self):
-        self._fingerprint = None
         self._data = None
         self._subject = None
         self._filepath = None
@@ -362,12 +362,12 @@ class Certificate:
     def get_data(self):
         return self._data
 
-    def get_fingerprint(self):
-        if self._fingerprint == None and self._data != None:
-            sha1 = hashlib.sha1()
-            sha1.update(self._data)
-            self._fingerprint = sha1.digest()
-        return self._fingerprint 
+    def get_fingerprint(self, hash):
+        if self._data is None:
+            return
+        sha = hashlib.sha1() if hash == 'sha1' else hashlib.sha256()
+        sha.update(self._data)
+        return sha.digest()
 
     def get_subject(self):
         """Get the certificate subject in human readable one line format
@@ -381,7 +381,7 @@ class Certificate:
         return None
 
     def get_subject_ASN1(self):
-        """Get the certificate subject in ASN1 encoded format as expected for the IOS trusted certificate keychain store
+        """Get the certificate subject in ASN1 encoded format as expected for the trusted certificate keychain store
         """
         if self._subject == None and self._data != None:
             self._subject = bytearray()
@@ -424,17 +424,19 @@ class Certificate:
                 input.leave()
 
 #----------------------------------------------------------------------
-# IOS TrustStore.sqlite3 handling
+# TrustStore.sqlite3 handling
 #----------------------------------------------------------------------
 
 class TrustStore:
-    """Represents the IOS trusted certificate store
+    """Represents the trusted certificate store
     """
-    def __init__(self, path, title=None):
+    def __init__(self, path, title=None, always_yes=False):
         self._path = path
-        if title: 
-            self._title = title 
-        else: 
+        self._hash = None
+        self.always_yes = always_yes
+        if title:
+            self._title = title
+        else:
             self._title = path
         self._tset = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"\
             "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"\
@@ -443,16 +445,21 @@ class TrustStore:
             "</plist>\n"
         #with open('cert_tset.plist', "rb") as inputFile:
         #    self._tset = inputFile.read()
-    
-    
+
     def is_valid(self):
         conn = sqlite3.connect(self._path)
         c = conn.cursor()
         row = c.execute('SELECT count(*) FROM sqlite_master WHERE type=\'table\' AND name=\'tsettings\'').fetchone()
+        if row[0] == 0:
+            conn.close()
+            return False
+        c = conn.cursor()
+        row = c.execute('SELECT sql FROM sqlite_master WHERE name=\'tsettings\'').fetchone()
+        self._hash = 'sha256' if 'sha256' in row[0] else 'sha1'
         conn.close()
-        return (row[0] > 0) 
-    
-    def _add_record(self, sha1, subj, tset, data):
+        return True
+
+    def _add_record(self, sha, subj, tset, data):
         if not self.is_valid():
             print "  Invalid TrustStore.sqlite3"
             return
@@ -461,10 +468,10 @@ class TrustStore:
         c.execute('SELECT COUNT(*) FROM tsettings WHERE subj=?', [sqlite3.Binary(subj)])
         row = c.fetchone()
         if row[0] == 0:
-            c.execute('INSERT INTO tsettings (sha1, subj, tset, data) VALUES (?, ?, ?, ?)', [sqlite3.Binary(sha1), sqlite3.Binary(subj), sqlite3.Binary(tset), sqlite3.Binary(data)])
+            c.execute('INSERT INTO tsettings (' + self._hash + ', subj, tset, data) VALUES (?, ?, ?, ?)', [sqlite3.Binary(sha), sqlite3.Binary(subj), sqlite3.Binary(tset), sqlite3.Binary(data)])
             print '  Certificate added'
         else:
-            c.execute('UPDATE tsettings SET sha1=?, tset=?, data=? WHERE subj=?', [sqlite3.Binary(sha1), sqlite3.Binary(tset), sqlite3.Binary(data), sqlite3.Binary(subj)])
+            c.execute('UPDATE tsettings SET ' + self._hash + '=?, tset=?, data=? WHERE subj=?', [sqlite3.Binary(sha), sqlite3.Binary(tset), sqlite3.Binary(data), sqlite3.Binary(subj)])
             print '  Existing certificate replaced'
         conn.commit()
         conn.close()
@@ -475,13 +482,16 @@ class TrustStore:
 
     def _saveBlob(self, baseName, name, data):
         with open(baseName + '_' + name + '.bin', 'wb') as outputFile:
-            outputFile.write (data)
+            outputFile.write(data)
 
-    
     def add_certificate(self, certificate):
-        self._add_record(certificate.get_fingerprint(), certificate.get_subject_ASN1(), 
+        # this also populates self._hash
+        if not self.is_valid():
+            print "  Invalid TrustStore.sqlite3"
+            return
+        self._add_record(certificate.get_fingerprint(self._hash), certificate.get_subject_ASN1(),
             self._tset, certificate.get_data())
-    
+
     def export_certificates(self, base_filename):
         if not self.is_valid():
             print "  Invalid TrustStore.sqlite3"
@@ -494,7 +504,7 @@ class TrustStore:
         for row in c.execute('SELECT subj, data FROM tsettings'):
             cert = Certificate()
             cert.load_data(row[1])
-            if query_yes_no("  " + cert.get_subject() + "    Export certificate", "no") == "yes":
+            if self.always_yes or query_yes_no("  " + cert.get_subject() + "    Export certificate", "no") == "yes":
                 cert.save_PEMfile(base_filename + "_" + str(index) + ".crt")
                 index = index + 1
         conn.close()
@@ -506,23 +516,29 @@ class TrustStore:
         conn = sqlite3.connect(self._path)
         c = conn.cursor()
         index = 1
-        for row in c.execute('SELECT sha1, subj, tset, data FROM tsettings'):
+        for row in c.execute('SELECT subj, tset, data FROM tsettings'):
             cert = Certificate()
-            cert.load_data(row[3])
-            if query_yes_no("  " + cert.get_subject() + "    Export certificate", "no") == "yes":
+            cert.load_data(row[2])
+            if self.always_yes or query_yes_no("  " + cert.get_subject() + "    Export certificate", "no") == "yes":
                 base_filename2 = base_filename + "_" + str(index)
-                self._saveBlob(base_filename2, 'sha1', row[0])
-                self._saveBlob(base_filename2, 'subj', row[1])
-                self._saveBlob(base_filename2, 'tset', row[2])
-                self._saveBlob(base_filename2, 'data', row[3])
+                self._saveBlob(base_filename2, 'subj', row[0])
+                self._saveBlob(base_filename2, 'tset', row[1])
+                self._saveBlob(base_filename2, 'data', row[2])
         conn.close()
 
     def import_certificate_data(self, base_filename):
-        certificateSha1 = self._loadBlob(base_filename, 'sha1')
+        # this also populates self._hash
+        if not self.is_valid():
+            print "  Invalid TrustStore.sqlite3"
+            return
         certificateSubject = self._loadBlob(base_filename, 'subj')
         certificateTSet = self._loadBlob(base_filename, 'tset')
         certificateData = self._loadBlob(base_filename, 'data')
-        self._add_record(certificateSha1, certificateSubject, certificateTSet, certificateData)
+        cert = Certificate()
+        cert.load_data(certificateData)
+        certificateSha = cert.get_fingerprint(self._hash)
+
+        self._add_record(certificateSha, certificateSubject, certificateTSet, certificateData)
 
     def list_certificates(self):
         print
@@ -550,7 +566,7 @@ class TrustStore:
         for row in c.execute('SELECT subj, data FROM tsettings'):
             cert = Certificate()
             cert.load_data(row[1])
-            if query_yes_no("  " + cert.get_subject() + "    Delete certificate", "no") == "yes":
+            if self.always_yes or query_yes_no("  " + cert.get_subject() + "    Delete certificate", "no") == "yes":
                 todelete.append(row[0])
         for item in todelete:
             c.execute('DELETE FROM tsettings WHERE subj=?', [item])
@@ -558,15 +574,18 @@ class TrustStore:
         conn.close()
 
 #----------------------------------------------------------------------
-# IOS Simulator access
+# Simulator access
 #----------------------------------------------------------------------
 
-class IOSSimulator:
-    """Represents an instance of an IOS simulator folder
+class Simulator:
+    """Represents an instance of an simulator folder
     """
     simulatorDir = os.getenv('HOME') + "/Library/Developer/CoreSimulator/Devices/"
-    trustStorePath = "/data/Library/Keychains/TrustStore.sqlite3"
-    runtimeName = "com.apple.CoreSimulator.SimRuntime.iOS-"
+    trustStorePaths = [
+        "/data/private/var/protected/trustd/private/TrustStore.sqlite3",
+        "/data/Library/Keychains/TrustStore.sqlite3",
+    ]
+    runtimeName = "com.apple.CoreSimulator.SimRuntime."
     
     def __init__(self, simulatordir):
         self._is_valid = False
@@ -578,31 +597,32 @@ class IOSSimulator:
                 self.version = runtime[len(self.runtimeName):].replace("-", ".")
             else:
                 self.version = runtime
-            self.title = info["name"] + " v" + self.version
-            self.truststore_file = simulatordir + self.trustStorePath
-            if os.path.isfile(self.truststore_file):
-                self._is_valid = True
-            
-        
+            self.title = info["name"] + " " + self.version
+            for path in self.trustStorePaths:
+                self.truststore_file = simulatordir + path
+                if os.path.isfile(self.truststore_file):
+                    self._is_valid = True
+                    return
+
     def is_valid(self):
         return self._is_valid
 
-def ios_simulators():
-    """An iterator over the available IOS simulator versions
+def simulators():
+    """An iterator over the available simulator versions
     """
-    for subdir in os.listdir(IOSSimulator.simulatorDir):
-        simulatordir = IOSSimulator.simulatorDir + subdir
+    for subdir in os.listdir(Simulator.simulatorDir):
+        simulatordir = Simulator.simulatorDir + subdir
         if os.path.isdir(simulatordir):
-            simulator = IOSSimulator(simulatordir)
+            simulator = Simulator(simulatordir)
             if simulator.is_valid():
                 yield simulator
-        
+
 #----------------------------------------------------------------------
 # Device backup support
 #----------------------------------------------------------------------
 
 class DeviceBackup:
-    """Represents an instance of an IOS simulator folder
+    """Represents an instance of an simulator folder
     """
     trustStore_filename = "61c8b15a0110ab17d1b7467c3a042eb1458426c6"
     
@@ -645,47 +665,47 @@ class Program:
         cert.load_PEMfile(certificate_filepath)
         print cert.get_subject()
         if truststore_filepath:
-            if query_yes_no("Import certificate to " + truststore_filepath, "no") == "yes":
-                tstore = TrustStore(truststore_filepath)
+            if self.always_yes or query_yes_no("Import certificate to " + truststore_filepath, "no") == "yes":
+                tstore = TrustStore(truststore_filepath, always_yes=self.always_yes)
                 tstore.add_certificate(cert)
             return
-        for simulator in ios_simulators():
-            if query_yes_no("Import certificate to " + simulator.title, "no") == "yes":
+        for simulator in simulators():
+            if self.always_yes or query_yes_no("Import certificate to " + simulator.title.encode('utf-8'), "no") == "yes":
                 print "Importing to " + simulator.truststore_file
-                tstore = TrustStore(simulator.truststore_file)
+                tstore = TrustStore(simulator.truststore_file, always_yes=self.always_yes)
                 tstore.add_certificate(cert)
     
     def addfromdump(self, dump_base_filename, truststore_filepath=None):
         if truststore_filepath:
-            if query_yes_no("Import to " + truststore_filepath, "no") == "yes":
-                tstore = TrustStore(truststore_filepath)
+            if self.always_yes or query_yes_no("Import to " + truststore_filepath, "no") == "yes":
+                tstore = TrustStore(truststore_filepath, always_yes=self.always_yes)
                 tstore.import_certificate_data(dump_base_filename)
             return
-        for simulator in ios_simulators():
-            if query_yes_no("Import to " + simulator.title, "no") == "yes":
+        for simulator in simulators():
+            if self.always_yes or query_yes_no("Import to " + simulator.title, "no") == "yes":
                 print "Importing to " + simulator.truststore_file
-                tstore = TrustStore(simulator.truststore_file)
+                tstore = TrustStore(simulator.truststore_file, always_yes=self.always_yes)
                 tstore.import_certificate_data(dump_base_filename)
     
     def list_simulator_trustedcertificates(self, truststore_filepath=None):
         if truststore_filepath:
-            tstore = TrustStore(truststore_filepath)
+            tstore = TrustStore(truststore_filepath, always_yes=self.always_yes)
             tstore.list_certificates()
             return
-        for simulator in ios_simulators():
-            tstore = TrustStore(simulator.truststore_file, simulator.title)
+        for simulator in simulators():
+            tstore = TrustStore(simulator.truststore_file, simulator.title, always_yes=self.always_yes)
             tstore.list_certificates()
     
     def export_simulator_trustedcertificates(self, certificate_base_filename, mode_dump, truststore_filepath=None):
         if truststore_filepath:
-            tstore = TrustStore(truststore_filepath)
+            tstore = TrustStore(truststore_filepath, always_yes=self.always_yes)
             if mode_dump:
                 tstore.export_certificates_data(certificate_base_filename)
             else:
                 tstore.export_certificates(certificate_base_filename)
             return
-        for simulator in ios_simulators():
-            tstore = TrustStore(simulator.truststore_file, simulator.title)
+        for simulator in simulators():
+            tstore = TrustStore(simulator.truststore_file, simulator.title, always_yes=self.always_yes)
             if mode_dump:
                 tstore.export_certificates_data(certificate_base_filename + "_" + simulator.version)
             else:
@@ -693,21 +713,21 @@ class Program:
     
     def delete_simulator_trustedcertificates(self, truststore_filepath=None):
         if truststore_filepath:
-            tstore = TrustStore(truststore_filepath)
+            tstore = TrustStore(truststore_filepath, always_yes=self.always_yes)
             tstore.delete_certificates()
             return
-        for simulator in ios_simulators():
-            tstore = TrustStore(simulator.truststore_file, simulator.title)
+        for simulator in simulators():
+            tstore = TrustStore(simulator.truststore_file, simulator.title, always_yes=self.always_yes)
             tstore.delete_certificates()
     
     def list_device_trustedcertificates(self):
         for backup in device_backups():
-            tstore = TrustStore(backup.get_truststore_file(), backup.title)
+            tstore = TrustStore(backup.get_truststore_file(), backup.title, always_yes=self.always_yes)
             tstore.list_certificates()
     
     def export_device_trustedcertificates(self, certificate_base_filename, mode_dump):
         for backup in device_backups():
-            tstore = TrustStore(backup.get_truststore_file(), backup.title)
+            tstore = TrustStore(backup.get_truststore_file(), backup.title, always_yes=self.always_yes)
             if mode_dump:
                 tstore.export_certificates_data(certificate_base_filename + "_" + backup.device_name)
             else:
@@ -716,15 +736,20 @@ class Program:
     def run(self):
         parser = argparse.ArgumentParser()
         group = parser.add_mutually_exclusive_group(required=True)
-        group.add_argument("-l", "--list", help="list custom trusted certificates in IOS simulator", action="store_true")
-        group.add_argument("-d", "--delete", help="delete custom trusted certificates in IOS simulator", action="store_true")
-        group.add_argument("-a", "--add", help="specifies a certificate file in PEM format to import and add to the IOS simulator trusted list", dest='certificate_file')
-        group.add_argument("-e", "--export", help="export custom trusted certificates from IOS simulator in PEM format. ", dest='export_base_filename')
-        group.add_argument("--dump", help="dump custom trusted certificates records from IOS simulator. ", dest='dump_base_filename')
-        group.add_argument("--addfromdump", help="add custom trusted certificates records to IOS simulator from dump file created with --dump. ", dest='adddump_base_filename')
-        parser.add_argument("-t", "--truststore", help="specify the path of the IOS TrustStore.sqlite3 file to edit. The default is to select and prompt for each available version")
+        group.add_argument("-l", "--list", help="list custom trusted certificates in simulator", action="store_true")
+        group.add_argument("-d", "--delete", help="delete custom trusted certificates in simulator", action="store_true")
+        group.add_argument("-a", "--add", help="specifies a certificate file in PEM format to import and add to the simulator trusted list", dest='certificate_file')
+        group.add_argument("-e", "--export", help="export custom trusted certificates from simulator in PEM format. ", dest='export_base_filename')
+        group.add_argument("--dump", help="dump custom trusted certificates records from simulator. ", dest='dump_base_filename')
+        group.add_argument("--addfromdump", help="add custom trusted certificates records to simulator from dump file created with --dump. ", dest='adddump_base_filename')
+        parser.add_argument("-t", "--truststore", help="specify the path of the TrustStore.sqlite3 file to edit. The default is to select and prompt for each available version")
         parser.add_argument("-b", "--devicebackup", help="(experimental) select a device backup as the TrustStore.sqlite3 source for list or export", action="store_true")
+        parser.add_argument("-y", "--yes", help="always answer yes to prompts", action="store_true")
         args = parser.parse_args()
+        if args.yes:
+            self.always_yes = True
+        else:
+            self.always_yes = False
         if args.truststore and not os.path.isfile(args.truststore):
             print "invalid file: ", args.truststore
             exit(1)
